@@ -10,22 +10,12 @@ import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from common import ApiError, in_scope, j, now, require_actor
+from effectiveness import DEFAULT_OVERDUE_DAYS, EffectivenessService
 
 DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def j(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
 
 
 class Store:
@@ -86,6 +76,17 @@ class Store:
           scope_version INTEGER NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
           created_at TEXT NOT NULL, UNIQUE(recall_id,scope_version)
         );
+        CREATE TABLE IF NOT EXISTS contact_attempts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
+          vehicle_id INTEGER NOT NULL REFERENCES vehicles(id),
+          result TEXT NOT NULL CHECK(result IN ('unreachable','reached')), note TEXT NOT NULL DEFAULT '',
+          actor TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS stats_archives (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
+          scope_version INTEGER NOT NULL, stats_json TEXT NOT NULL, archived_by TEXT NOT NULL,
+          archived_at TEXT NOT NULL, UNIQUE(recall_id,scope_version)
+        );
         CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
@@ -104,12 +105,11 @@ class Store:
 class RecallService:
     def __init__(self, store: Store):
         self.store, self.conn = store, store.conn
+        self.effectiveness = EffectivenessService(store)
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
-        if not actor: raise ApiError(401, "缺少身份")
-        if role not in allowed: raise ApiError(403, "角色无权执行此操作")
-        return actor
+        return require_actor(actor, role, allowed)
 
     def _row(self, table: str, identity: object, column: str = "id") -> sqlite3.Row:
         row = self.conn.execute(f"SELECT * FROM {table} WHERE {column}=?", (identity,)).fetchone()
@@ -202,6 +202,7 @@ class RecallService:
         if int(expected_version) != int(recall["revision"]): raise ApiError(409, "召回已被修改，请刷新版本")
         scope_version = int(recall["scope_version"]) + 1
         with self.conn:
+            self.effectiveness.archive_version(recall_id, int(recall["scope_version"]), actor)  # 旧范围版本账目留档
             self.conn.execute("UPDATE recalls SET scope_json=?,scope_version=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
                               (j(scope), scope_version, now(), recall_id, expected_version))
             self.conn.execute("INSERT INTO scope_changes(recall_id,scope_version,scope_json,created_by,created_at) VALUES(?,?,?,?,?)",
@@ -222,6 +223,28 @@ class RecallService:
             self.store.audit(actor, "parts.add", "recall", recall_id, {"dealer_id": dealer_id, "quantity": quantity, "remedy_version": remedy_version})
         row = self.conn.execute("SELECT * FROM parts WHERE recall_id=? AND dealer_id=? AND remedy_version=?", (recall_id, dealer_id, remedy_version)).fetchone()
         return dict(row)
+
+    def notify_owners(self, actor: str | None, role: str | None, recall_id: int, vin: str = "") -> dict:
+        actor = self._actor(actor, role, {"manufacturer"})
+        recall = self._row("recalls", recall_id)
+        if recall["manufacturer"] != actor: raise ApiError(403, "只能操作本机构的召回")
+        if recall["state"] != "published": raise ApiError(409, "召回尚未发布")
+        scope = json.loads(recall["scope_json"])
+        scope_version = int(recall["scope_version"])
+        vehicles = [row for row in self.conn.execute("SELECT * FROM vehicles ORDER BY id") if self._in_scope(row, scope)]
+        if vin.strip():
+            vehicles = [v for v in vehicles if v["vin"] == vin.upper().strip()]
+            if not vehicles: raise ApiError(404, "车辆不在当前召回范围内")
+        sent = 0
+        with self.conn:
+            for vehicle in vehicles:
+                self.conn.execute("""INSERT OR IGNORE INTO notifications(recall_id,vehicle_id,scope_version,channel,status,created_at)
+                                     VALUES(?,?,?, 'owner-notice','queued',?)""", (recall_id, vehicle["id"], scope_version, now()))
+                cur = self.conn.execute("UPDATE notifications SET status='sent' WHERE recall_id=? AND vehicle_id=? AND scope_version=? AND status='queued'",
+                                        (recall_id, vehicle["id"], scope_version))
+                sent += cur.rowcount
+            self.store.audit(actor, "recall.notify", "recall", recall_id, {"scope_version": scope_version, "sent": sent, "vin": vin or "all"})
+        return {"recall_id": recall_id, "scope_version": scope_version, "sent": sent}
 
     def report_repair(self, actor: str | None, role: str | None, recall_id: int, vin: str, dealer_id: int, remedy_version: int, evidence_hash: str, evidence_consistent: bool, border_permit: str = "", idempotency_key: str = "") -> dict:
         actor = self._actor(actor, role, {"dealer"})
@@ -255,14 +278,18 @@ class RecallService:
         actor = self._actor(actor, role, {"regulator"})
         if decision not in {"confirm", "flag"}: raise ApiError(400, "决定只能是 confirm 或 flag")
         repair = self._row("repairs", repair_id)
-        if repair["status"] != "reported": raise ApiError(409, "维修记录已经复核")
-        new_status = "confirmed" if decision == "confirm" and repair["evidence_consistent"] else "flagged"
+        if decision == "confirm":
+            if repair["status"] != "reported": raise ApiError(409, "维修记录已经复核")
+            new_status = "confirmed" if repair["evidence_consistent"] else "flagged"
+        else:  # 复核退回：已上报或已确认的记录都可退回，已修数随之减少
+            if repair["status"] not in {"reported", "confirmed"}: raise ApiError(409, "维修记录已经复核")
+            new_status = "flagged"
         with self.conn:
             self.conn.execute("UPDATE repairs SET status=?,reviewed_by=?,reviewed_at=?,review_note=? WHERE id=?", (new_status, actor, now(), note, repair_id))
             if new_status == "flagged":
                 self.conn.execute("UPDATE parts SET available=available+1 WHERE recall_id=? AND dealer_id=? AND remedy_version=?",
                                   (repair["recall_id"], repair["dealer_id"], repair["remedy_version"]))
-            self.store.audit(actor, "repair.review", "repair", repair_id, {"decision": decision, "status": new_status, "note": note})
+            self.store.audit(actor, "repair.review", "repair", repair_id, {"decision": decision, "status": new_status, "previous_status": repair["status"], "note": note})
         return dict(self._row("repairs", repair_id))
 
     def _create_release_artifacts(self, recall_id: int, scope_version: int, actor: str) -> None:
@@ -272,6 +299,8 @@ class RecallService:
             for vehicle in vehicles:
                 self.conn.execute("""INSERT OR IGNORE INTO notifications(recall_id,vehicle_id,scope_version,channel,status,created_at)
                                      VALUES(?,?,?, 'owner-notice','queued',?)""", (recall_id, vehicle["id"], scope_version, now()))
+            self.conn.execute("INSERT OR IGNORE INTO scope_changes(recall_id,scope_version,scope_json,created_by,created_at) VALUES(?,?,?,?,?)",
+                              (recall_id, scope_version, j(scope), actor, now()))  # 首版范围同样留档，各版本可追溯
             payload = {"campaign_code": recall["campaign_code"], "scope_version": scope_version, "scope": scope,
                        "remedy_version": recall["remedy_version"], "affected_count": len(vehicles)}
             self.conn.execute("INSERT OR IGNORE INTO regulatory_reports(recall_id,scope_version,payload_json,status,created_at) VALUES(?,?,?, 'queued',?)",
@@ -293,9 +322,7 @@ class RecallService:
 
     @staticmethod
     def _in_scope(vehicle: sqlite3.Row, scope: dict) -> bool:
-        return (vehicle["model"] in scope.get("models", []) and int(vehicle["model_year"]) in scope.get("model_years", [])
-                and any(vehicle["vin"].startswith(prefix.upper()) for prefix in scope.get("vin_prefixes", []))
-                and (vehicle["country"] in scope.get("countries", []) or vehicle["origin_country"] in scope.get("countries", [])))
+        return in_scope(vehicle, scope)
 
     @staticmethod
     def _validate_scope(scope: dict) -> None:
@@ -351,6 +378,11 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 3 and p[:2] == ["api", "recalls"]: out = self.service.recall_detail(int(p[2]))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "unfinished":
                 out = self.service.unfinished(self.headers.get("X-Actor"), self.headers.get("X-Role"), int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "effectiveness":
+                query = parse_qs(urlparse(self.path).query)
+                out = self.service.effectiveness.stats(self.headers.get("X-Actor"), self.headers.get("X-Role"), int(p[2]), int(query.get("overdue_days", [DEFAULT_OVERDUE_DAYS])[0]))
+            elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "unreachable":
+                out = self.service.effectiveness.unreachable(self.headers.get("X-Actor"), self.headers.get("X-Role"), int(p[2]))
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
@@ -368,6 +400,8 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "submit": out = self.service.submit_recall(actor, role, int(p[2]), int(body.get("expected_version", -1)))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "review": out = self.service.review_recall(actor, role, int(p[2]), body.get("decision", ""), int(body.get("expected_version", -1)), body.get("note", ""))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "scope": out = self.service.change_scope(actor, role, int(p[2]), body.get("scope", {}), int(body.get("expected_version", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "notify": out = self.service.notify_owners(actor, role, int(p[2]), body.get("vin", ""))
+            elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "contacts": out = self.service.effectiveness.record_contact(actor, role, int(p[2]), body.get("vin", ""), body.get("result", ""), body.get("note", ""))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "parts": out = self.service.add_parts(actor, role, int(p[2]), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), int(body.get("quantity", 0)))
             elif p == ["api", "repairs"]: out = self.service.report_repair(actor, role, int(body.get("recall_id", 0)), body.get("vin", ""), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), body.get("evidence_hash", ""), bool(body.get("evidence_consistent", True)), body.get("border_permit", ""), body.get("idempotency_key", ""))
             elif len(p) == 4 and p[:2] == ["api", "repairs"] and p[3] == "review": out = self.service.review_repair(actor, role, int(p[2]), body.get("decision", ""), body.get("note", ""))
